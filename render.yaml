@@ -10,14 +10,18 @@ services:
         sync: false
       - key: FIREBASE_DB_URL
         value: https://aviabustout-default-rtdb.firebaseio.com
-      - key: STRIPE_SECRET_KEY
+      - key: INTASEND_PUBLISHABLE_KEY
         sync: false
-      - key: STRIPE_WEBHOOK_SECRET
+      - key: INTASEND_WEBHOOK_CHALLENGE
         sync: false
+      - key: INTASEND_LIVE
+        value: "false"
       - key: APP_URL
         value: https://wazungukonect.vercel.app
-      - key: COIN_PRICE_USD_CENTS
-        value: "100"
+      - key: PRICE_AMOUNT
+        value: "130"
+      - key: PRICE_CURRENCY
+        value: "KES"
       - key: COINS_PER_PURCHASE
         value: "30"
       - key: COINS_PER_AD

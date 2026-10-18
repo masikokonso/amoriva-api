@@ -1,20 +1,24 @@
 """
-Amoriva coin backend — Flask on Render.
+Amoriva coin backend — Flask on Render (IntaSend).
 
-The ONLY place coins are ever added. The web app can spend coins but can't add them
+The ONLY place coins are ever added. The app can spend coins but can't add them
 (the database rules make users/{uid}/coins decrease-only). This server credits coins
-after verifying a real card payment (Stripe) or a real rewarded ad (AdMob SSV).
+after verifying a real card/M-Pesa payment (IntaSend) or a rewarded ad (AdMob SSV).
+
+IntaSend accepts international cards AND M-Pesa, and settles to a Kenyan account.
 
 Environment variables (Render → Environment):
-  FIREBASE_SERVICE_ACCOUNT : full service-account JSON (one line)
-  FIREBASE_DB_URL          : https://aviabustout-default-rtdb.firebaseio.com
-  STRIPE_SECRET_KEY        : sk_live_... (or sk_test_... while testing)
-  STRIPE_WEBHOOK_SECRET    : whsec_...  (from the Stripe webhook you create)
-  APP_URL                  : https://wazungukonect.vercel.app
-  COIN_PRICE_USD_CENTS     : 100   # $1.00 per pack
-  COINS_PER_PURCHASE       : 30
-  COINS_PER_AD             : 10
-  ADMOB_SSV_KEYS_URL       : https://www.gstatic.com/admob/reward/verifier-keys.json
+  FIREBASE_SERVICE_ACCOUNT   : full service-account JSON (one line)
+  FIREBASE_DB_URL            : https://aviabustout-default-rtdb.firebaseio.com
+  INTASEND_PUBLISHABLE_KEY   : ISPubKey_... (from IntaSend dashboard)
+  INTASEND_WEBHOOK_CHALLENGE : the challenge word you set on the IntaSend webhook
+  INTASEND_LIVE              : "false" for sandbox, "true" for live
+  APP_URL                    : https://wazungukonect.vercel.app
+  PRICE_AMOUNT               : 130        # price per coin pack
+  PRICE_CURRENCY             : KES
+  COINS_PER_PURCHASE         : 30
+  COINS_PER_AD               : 10
+  ADMOB_SSV_KEYS_URL         : https://www.gstatic.com/admob/reward/verifier-keys.json
 """
 
 import os
@@ -25,24 +29,26 @@ import hashlib
 from urllib.parse import parse_qsl
 
 import requests
-import stripe
-from flask import Flask, request, jsonify, redirect
+from flask import Flask, request, jsonify
 
 import firebase_admin
 from firebase_admin import credentials, auth as fb_auth, db as fb_db
 
 # ---- Config -----------------------------------------------------------------
-DB_URL              = os.environ["FIREBASE_DB_URL"]
-APP_URL             = os.environ.get("APP_URL", "https://wazungukonect.vercel.app").rstrip("/")
-COIN_PRICE_CENTS    = int(os.environ.get("COIN_PRICE_USD_CENTS", "100"))
-COINS_PER_PURCHASE  = int(os.environ.get("COINS_PER_PURCHASE", "30"))
-COINS_PER_AD        = int(os.environ.get("COINS_PER_AD", "10"))
-ADMOB_KEYS_URL      = os.environ.get("ADMOB_SSV_KEYS_URL",
-                                     "https://www.gstatic.com/admob/reward/verifier-keys.json")
-STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
-ROOT                = "amoriva"
+DB_URL            = os.environ["FIREBASE_DB_URL"]
+APP_URL           = os.environ.get("APP_URL", "https://wazungukonect.vercel.app").rstrip("/")
+PUB_KEY           = os.environ["INTASEND_PUBLISHABLE_KEY"]
+WEBHOOK_CHALLENGE = os.environ.get("INTASEND_WEBHOOK_CHALLENGE", "")
+LIVE              = os.environ.get("INTASEND_LIVE", "false").lower() == "true"
+PRICE_AMOUNT      = float(os.environ.get("PRICE_AMOUNT", "130"))
+PRICE_CURRENCY    = os.environ.get("PRICE_CURRENCY", "KES")
+COINS_PER_PURCHASE = int(os.environ.get("COINS_PER_PURCHASE", "30"))
+COINS_PER_AD       = int(os.environ.get("COINS_PER_AD", "10"))
+ADMOB_KEYS_URL    = os.environ.get("ADMOB_SSV_KEYS_URL",
+                                   "https://www.gstatic.com/admob/reward/verifier-keys.json")
+ROOT              = "amoriva"
 
-stripe.api_key = os.environ["STRIPE_SECRET_KEY"]
+INTASEND_BASE = "https://payment.intasend.com" if LIVE else "https://sandbox.intasend.com"
 
 cred = credentials.Certificate(json.loads(os.environ["FIREBASE_SERVICE_ACCOUNT"]))
 firebase_admin.initialize_app(cred, {"databaseURL": DB_URL})
@@ -52,11 +58,10 @@ app = Flask(__name__)
 
 # ---- Helpers ----------------------------------------------------------------
 def credit_coins(uid: str, amount: int, reason: str, ref_id: str) -> int:
-    """Add coins atomically. Idempotent per ref_id so a webhook that fires twice
-    never double-credits."""
+    """Add coins atomically, idempotent per ref_id (a repeated webhook never double-credits)."""
     guard = fb_db.reference(f"{ROOT}/coinGrants/{ref_id}")
     if guard.get() is not None:
-        return -1  # already processed
+        return -1
     guard.set({"uid": uid, "amount": amount, "reason": reason, "at": int(time.time() * 1000)})
     coins_ref = fb_db.reference(f"{ROOT}/users/{uid}/coins")
     return coins_ref.transaction(lambda cur: (cur or 0) + amount)
@@ -77,59 +82,73 @@ def health():
 
 @app.post("/coins/checkout")
 def coins_checkout():
-    """App calls this with the user's Firebase ID token. Creates a Stripe Checkout
-    session and returns its URL. No coins are added here — only on the webhook."""
+    """App calls this with the user's Firebase ID token. Creates an IntaSend hosted
+    checkout and returns its URL. No coins are added here — only on the webhook."""
     try:
         uid = verify_id_token(request)
     except Exception:
         return jsonify({"error": "unauthorized"}), 401
 
+    body = request.get_json(silent=True) or {}
+    email = body.get("email") or f"{uid}@amoriva.user"   # IntaSend needs an email
+    api_ref = f"buy_{uid}_{int(time.time())}"
+
+    # Remember what this reference is worth, so the webhook credits the right amount.
+    fb_db.reference(f"{ROOT}/pendingBuys/{api_ref}").set(
+        {"uid": uid, "coins": COINS_PER_PURCHASE, "at": int(time.time() * 1000)}
+    )
+
+    payload = {
+        "public_key": PUB_KEY,
+        "amount": PRICE_AMOUNT,
+        "currency": PRICE_CURRENCY,
+        "email": email,
+        "api_ref": api_ref,
+        "comment": f"{COINS_PER_PURCHASE} Amoriva coins",
+        "redirect_url": f"{APP_URL}/profile.html#wallet",
+        "host": APP_URL,
+    }
     try:
-        session = stripe.checkout.Session.create(
-            mode="payment",
-            payment_method_types=["card"],
-            line_items=[{
-                "quantity": 1,
-                "price_data": {
-                    "currency": "usd",
-                    "unit_amount": COIN_PRICE_CENTS,
-                    "product_data": {"name": f"{COINS_PER_PURCHASE} Amoriva coins"},
-                },
-            }],
-            metadata={"uid": uid, "coins": str(COINS_PER_PURCHASE)},
-            success_url=f"{APP_URL}/profile.html#wallet?paid=1",
-            cancel_url=f"{APP_URL}/profile.html#wallet",
-        )
-        return jsonify({"url": session.url})
+        r = requests.post(f"{INTASEND_BASE}/api/v1/checkout/", json=payload, timeout=30)
+        r.raise_for_status()
+        url = r.json().get("url")
+        if not url:
+            raise ValueError("no url in response")
+        return jsonify({"url": url})
     except Exception as e:
-        return jsonify({"error": "stripe_failed", "detail": str(e)}), 502
+        return jsonify({"error": "intasend_failed", "detail": str(e)}), 502
 
 
-@app.post("/stripe/webhook")
-def stripe_webhook():
-    """Stripe calls this when a payment completes. Credit coins only on success."""
-    payload = request.get_data()
-    sig = request.headers.get("Stripe-Signature", "")
-    try:
-        event = stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
-    except Exception:
-        return "bad signature", 400
+@app.post("/intasend/webhook")
+def intasend_webhook():
+    """IntaSend calls this when a payment's state changes. Credit coins only when the
+    challenge matches and the state is COMPLETE."""
+    data = request.get_json(silent=True) or {}
 
-    if event["type"] == "checkout.session.completed":
-        session = event["data"]["object"]
-        if session.get("payment_status") == "paid":
-            uid = (session.get("metadata") or {}).get("uid")
-            coins = int((session.get("metadata") or {}).get("coins", COINS_PER_PURCHASE))
-            if uid:
-                credit_coins(uid, coins, "purchase", f"stripe_{session['id']}")
+    # 1) Verify it's really from IntaSend using the challenge you configured.
+    if not WEBHOOK_CHALLENGE or data.get("challenge") != WEBHOOK_CHALLENGE:
+        return jsonify({"ok": False, "error": "bad_challenge"}), 403
+
+    state = str(data.get("state", "")).upper()
+    api_ref = data.get("api_ref")
+    invoice_id = data.get("invoice_id") or data.get("id") or api_ref
+
+    if state != "COMPLETE" or not api_ref:
+        return jsonify({"ok": True})  # ignore non-success / incomplete events
+
+    pending = fb_db.reference(f"{ROOT}/pendingBuys/{api_ref}").get()
+    if not pending:
+        return jsonify({"ok": False, "error": "unknown_reference"}), 404
+
+    credit_coins(pending["uid"], int(pending["coins"]), "purchase", f"intasend_{invoice_id}")
+    fb_db.reference(f"{ROOT}/pendingBuys/{api_ref}").delete()
     return jsonify({"ok": True})
 
 
 @app.get("/admob/ssv")
 def admob_ssv():
     """AdMob rewarded-ad server-side verification (Android app only).
-    Set the ad's custom data to the user's uid; AdMob calls this after the ad is watched.
-    Docs: https://developers.google.com/admob/android/rewarded-ssv"""
+    Set the ad's custom data to the user's uid; AdMob calls this after the ad is watched."""
     args = request.args.to_dict()
     if not _verify_admob_signature(request.query_string.decode()):
         return "invalid signature", 403
@@ -158,7 +177,7 @@ def _verify_admob_signature(query_string: str) -> bool:
         from ecdsa import VerifyingKey
         from ecdsa.util import sigdecode_der
     except Exception:
-        return False  # fail closed — never credit an unverified ad
+        return False
     try:
         idx = query_string.rfind("&signature=")
         if idx == -1:

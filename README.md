@@ -1,63 +1,73 @@
-# Amoriva coin backend
+# Amoriva coin backend (IntaSend)
 
 The only place coins are ever **added**. The app can spend coins but can't add them
 (the database rules make `users/{uid}/coins` decrease-only). This service credits coins
-after verifying a real **card payment (Stripe)** or a real **rewarded ad (AdMob SSV)**.
+after verifying a real payment (IntaSend — international cards **and** M-Pesa) or a real
+rewarded ad (AdMob SSV).
 
 ## Endpoints
-- `POST /coins/checkout` — app calls this (with the user's Firebase ID token). Creates a
-  Stripe Checkout session and returns `{ url }`. The app redirects the user there to pay
-  by card. **No coins are added here.**
-- `POST /stripe/webhook` — Stripe calls this when payment completes. Credits coins only on
-  a paid session. Idempotent (a repeated webhook never double-credits).
+- `POST /coins/checkout` — app calls this (with the user's Firebase ID token). Creates an
+  IntaSend hosted checkout and returns `{ url }`. The app redirects the user there to pay.
+  **No coins are added here.**
+- `POST /intasend/webhook` — IntaSend calls this when a payment completes. Credits coins
+  only when the challenge matches and the state is `COMPLETE`. Idempotent (no double-credit).
 - `GET /admob/ssv` — AdMob calls this after a rewarded ad is watched (Android app only).
-  Signature is verified against Google's public keys before crediting.
 
-## Why Stripe (and a Play Store note)
-Stripe Checkout takes cards worldwide, so this works globally, not just Kenya.
-**Important:** if you publish the B4A app on the Google Play Store, Google requires
-**Google Play Billing** for digital goods (coins) bought *inside the app* — using Stripe
-cards inside the Play app breaks Play policy. So: Stripe for the website / PWA, and
-Google Play Billing inside the Android app (it can credit coins by calling a similar
-verify-and-credit endpoint here).
+## Step 1 — IntaSend account
+1. Sign up at intasend.com and verify (ID / KRA PIN — quick for Kenyan businesses).
+2. Stay in **Sandbox** while testing (toggle in the dashboard).
+3. Dashboard → **API Keys / Settings**: copy your **Publishable key** (`ISPubKey_...`).
 
-## Deploy on Render
-1. Push this folder to a GitHub repo.
-2. Render → New → Web Service → pick the repo (it reads `render.yaml`).
-3. Set environment variables (Render → Environment):
-   - `FIREBASE_SERVICE_ACCOUNT` — Firebase Console → Project settings → **Service accounts**
-     → *Generate new private key*. Paste the whole JSON as one value.
-   - `STRIPE_SECRET_KEY` — Stripe Dashboard → Developers → API keys (`sk_test_...` to test).
-   - `APP_URL` — `https://wazungukonect.vercel.app`
-   - `COIN_PRICE_USD_CENTS` — `100` for $1 (change to your price).
-4. Deploy. Health check: open the service URL → "Amoriva coin service OK".
+## Step 2 — Put this folder on GitHub
+Unzip and push `app.py`, `requirements.txt`, `render.yaml`, `README.md` to a new repo.
 
-## Create the Stripe webhook
-Stripe Dashboard → Developers → **Webhooks** → Add endpoint:
-- URL: `https://<your-service>.onrender.com/stripe/webhook`
-- Event: `checkout.session.completed`
-- Copy the signing secret (`whsec_...`) into the `STRIPE_WEBHOOK_SECRET` env var and redeploy.
+## Step 3 — Firebase admin key
+Firebase Console → `aviabustout` → gear → Project settings → **Service accounts** →
+*Generate new private key*. Open the downloaded JSON, copy the whole thing (one value).
 
-## Wire the app to it
+## Step 4 — Deploy on Render
+Render → New → Web Service → pick the repo (it reads `render.yaml`). Set env vars:
+- `FIREBASE_SERVICE_ACCOUNT` = the JSON from Step 3
+- `INTASEND_PUBLISHABLE_KEY` = your `ISPubKey_...`
+- `INTASEND_LIVE` = `false` (sandbox) for now
+- `APP_URL` = `https://wazungukonect.vercel.app`
+- `PRICE_AMOUNT` = `130` , `PRICE_CURRENCY` = `KES` (set your real price)
+- `INTASEND_WEBHOOK_CHALLENGE` = leave blank until Step 5, then fill it
+Deploy. Open the service URL → it should say "Amoriva coin service OK". Copy that URL.
+
+## Step 5 — Create the IntaSend webhook
+IntaSend dashboard → **Webhooks**:
+- URL: `https://<your-service>.onrender.com/intasend/webhook`
+- **Challenge:** type any secret word (e.g. a random string). Save it.
+- Put that same word in Render → `INTASEND_WEBHOOK_CHALLENGE` → redeploy.
+The challenge is how the backend confirms a webhook really came from IntaSend.
+
+## Step 6 — Point the app at the backend
 In `common.js`:
 ```js
 const COINS = { ...,
+  priceLabel: "KES 130",
   backendUrl: "https://<your-service>.onrender.com"
 };
 ```
-The "Buy" button then redirects to Stripe Checkout; after payment the webhook credits the
-coins and the user returns to the wallet.
+Push the website so Vercel redeploys.
+
+## Step 7 — Test
+Profile → Buy coins → you're sent to IntaSend's checkout. In sandbox, use IntaSend's test
+card/M-Pesa numbers from their docs. After paying, your coin balance goes up by 30 within
+a few seconds. When it all works, switch `INTASEND_LIVE` to `true` and use your live
+publishable key + a live webhook.
 
 ## AdMob rewarded ads (Android app only)
 Rewarded ads come from the AdMob SDK inside the B4A app, not the website. In the app:
-1. Show a rewarded ad.
-2. Set the ad's **custom data (SSV)** to the signed-in user's `uid`.
-3. AdMob console → set the **server-side verification URL** to
+1. Show a rewarded ad; set its **custom data (SSV)** to the user's `uid`.
+2. AdMob console → set the **server-side verification URL** to
    `https://<your-service>.onrender.com/admob/ssv`.
-Expose `window.AmorivaAds.showRewarded()` in the WebView so the web UI can trigger it.
+3. Expose `window.AmorivaAds.showRewarded()` in the WebView so the web UI can trigger it.
 
 ## Data it writes (under /amoriva)
-- `users/{uid}/coins`   — balance (incremented here, decremented by the app)
-- `coinGrants/{refId}`  — one record per credit (prevents double-crediting)
+- `users/{uid}/coins`       — balance (incremented here, decremented by the app)
+- `coinGrants/{refId}`      — one record per credit (prevents double-crediting)
+- `pendingBuys/{api_ref}`   — in-flight purchases awaiting the IntaSend webhook
 
 These have no client rules, so the browser can't touch them — only the Admin SDK can.
