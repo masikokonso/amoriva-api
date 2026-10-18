@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: amoriva-api
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --timeout 60
+    envVars:
+      - key: FIREBASE_SERVICE_ACCOUNT
+        sync: false
+      - key: FIREBASE_DB_URL
+        value: https://aviabustout-default-rtdb.firebaseio.com
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: APP_URL
+        value: https://wazungukonect.vercel.app
+      - key: COIN_PRICE_USD_CENTS
+        value: "100"
+      - key: COINS_PER_PURCHASE
+        value: "30"
+      - key: COINS_PER_AD
+        value: "10"
